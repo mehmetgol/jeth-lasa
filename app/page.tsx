@@ -69,18 +69,13 @@ function sleep(ms: number) {
 /**
  * 503 (high demand) gibi geçici hatalarda retry yapan fetch wrapper.
  */
-async function fetchWithRetry(
-    input: RequestInfo | URL,
-    init: RequestInit,
-    retries = 3
-) {
+async function fetchWithRetry(input: RequestInfo | URL, init: RequestInit, retries = 3) {
     let lastErr: unknown = null;
 
     for (let i = 0; i <= retries; i++) {
         try {
             const res = await fetch(input, init);
 
-            // 503 -> geçici yoğunluk, retry
             if (res.status === 503 && i < retries) {
                 const wait = 1200 * Math.pow(2, i);
                 await sleep(wait);
@@ -104,9 +99,7 @@ async function fetchWithRetry(
 
 // ✅ PDF -> PNG Dönüştürücü (TS uyumlu, GlobalWorkerOptions hatasız)
 async function pdfToImages(pdfFile: File, maxPages = 2): Promise<File[]> {
-    const pdfjs = (await import(
-        "pdfjs-dist/legacy/build/pdf.mjs"
-        )) as unknown as {
+    const pdfjs = (await import("pdfjs-dist/legacy/build/pdf.mjs")) as unknown as {
         version: string;
         GlobalWorkerOptions: { workerSrc: string };
         getDocument: (src: { data: Uint8Array }) => {
@@ -117,7 +110,6 @@ async function pdfToImages(pdfFile: File, maxPages = 2): Promise<File[]> {
         };
     };
 
-    // Worker'ı aynı sürümden çek
     pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/legacy/build/pdf.worker.min.mjs`;
 
     const ab = await pdfFile.arrayBuffer();
@@ -140,9 +132,7 @@ async function pdfToImages(pdfFile: File, maxPages = 2): Promise<File[]> {
 
         await page.render({ canvasContext: ctx, viewport }).promise;
 
-        const blob = await new Promise<Blob | null>((resolve) =>
-            canvas.toBlob((b) => resolve(b), "image/png")
-        );
+        const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob((b) => resolve(b), "image/png"));
 
         if (blob) {
             out.push(
@@ -160,15 +150,16 @@ async function pdfToImages(pdfFile: File, maxPages = 2): Promise<File[]> {
 export default function Page() {
     const [pdf, setPdf] = useState<File | null>(null);
     const [images, setImages] = useState<File[]>([]);
+
     const [pdfImages, setPdfImages] = useState<File[]>([]);
-    const [pdfConvertStatus, setPdfConvertStatus] = useState("");
+    const [pdfConvertStatus, setPdfConvertStatus] = useState<string>("");
 
     const [summary, setSummary] = useState<ApiSummary | null>(null);
-    const [status, setStatus] = useState("");
-    const [loading, setLoading] = useState(false);
+    const [status, setStatus] = useState<string>("");
+    const [loading, setLoading] = useState<boolean>(false);
 
     const [history, setHistory] = useState<HistoryItem[]>([]);
-    const [fileKey, setFileKey] = useState(0);
+    const [fileKey, setFileKey] = useState<number>(0);
 
     // LocalStorage Yükleme
     useEffect(() => {
@@ -185,21 +176,25 @@ export default function Page() {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(history));
     }, [history]);
 
-    const ordered = useMemo(
-        () => [...history].sort((a, b) => b.createdAt - a.createdAt),
-        [history]
-    );
+    const ordered = useMemo(() => [...history].sort((a, b) => b.createdAt - a.createdAt), [history]);
 
+    const effectiveImages = images.length > 0 ? images : pdfImages;
     const canProcess = !!pdf || images.length > 0;
 
-    // PDF Seçilince Otomatik İşleme
+    // PDF Seçilince Otomatik İşleme (manuel görsel varsa gerek yok)
     useEffect(() => {
         let alive = true;
 
         async function run() {
             setPdfImages([]);
             setPdfConvertStatus("");
+
             if (!pdf) return;
+
+            if (images.length > 0) {
+                setPdfConvertStatus("Manuel görsel seçildiği için PDF dönüştürme atlandı.");
+                return;
+            }
 
             setPdfConvertStatus("PDF sayfaları hazırlanıyor...");
             try {
@@ -207,7 +202,9 @@ export default function Page() {
                 if (!alive) return;
 
                 if (imgs.length === 0) {
-                    setPdfConvertStatus("PDF içeriği okunamadı (tarama olabilir).");
+                    setPdfConvertStatus(
+                        "PDF içeriği okunamadı. Bu PDF taranmış olabilir. (Çözüm: Manuel sayfa görseli ekleyin.)"
+                    );
                 } else {
                     setPdfImages(imgs);
                     setPdfConvertStatus(`PDF'den ${imgs.length} sayfa hazırlandı ✅`);
@@ -215,7 +212,9 @@ export default function Page() {
             } catch (e) {
                 console.error("PDF İşleme Hatası:", e);
                 if (!alive) return;
-                setPdfConvertStatus("PDF dönüştürme hatası. Dosyayı kontrol edin.");
+                setPdfConvertStatus(
+                    "PDF dönüştürme hatası. Bu PDF taranmış/korumalı olabilir. (Çözüm: Manuel görsel ekleyin.)"
+                );
             }
         }
 
@@ -223,12 +222,16 @@ export default function Page() {
         return () => {
             alive = false;
         };
-    }, [pdf]);
+    }, [pdf, images.length]);
 
-    // Özetle
     async function handleSummarize() {
         if (!canProcess) {
             setStatus("Dosya seçilmedi.");
+            return;
+        }
+
+        if (pdf && images.length === 0 && pdfImages.length === 0) {
+            setStatus("PDF sayfaları hazırlanmadı / hazırlanamadı. (Taranmış olabilir: Manuel sayfa görseli ekleyin.)");
             return;
         }
 
@@ -239,39 +242,20 @@ export default function Page() {
         try {
             const fd = new FormData();
             if (pdf) fd.append("pdf", pdf);
+            effectiveImages.forEach((img) => fd.append("images", img));
 
-            // Kullanıcı görsel eklemişse onları, yoksa PDF'den üretilenleri ekle
-            const targetImages = images.length > 0 ? images : pdfImages;
-            targetImages.forEach((img) => fd.append("images", img));
-
-            const res = await fetchWithRetry(
-                "/api/summarize",
-                { method: "POST", body: fd },
-                3
-            );
+            const res = await fetchWithRetry("/api/summarize", { method: "POST", body: fd }, 3);
 
             let json: unknown = null;
             try {
                 json = await res.json();
-            } catch {
-                // json gelmezse aşağıda generic hata basarız
-            }
+            } catch {}
 
             if (!res.ok) {
-                if (res.status === 429) {
-                    setStatus("Kota sınırına ulaşıldı (429). Biraz sonra tekrar deneyin.");
-                    return;
-                }
-                if (res.status === 503) {
-                    setStatus("Model şu an yoğun (503). Birkaç saniye sonra tekrar deneyin.");
-                    return;
-                }
-                if (isErrResponse(json)) {
-                    setStatus(json.error);
-                    return;
-                }
-                setStatus(`Sunucu hatası (${res.status}).`);
-                return;
+                if (res.status === 429) return void setStatus("Kota sınırına ulaşıldı (429). Biraz sonra tekrar deneyin.");
+                if (res.status === 503) return void setStatus("Model şu an yoğun (503). Birkaç saniye sonra tekrar deneyin.");
+                if (isErrResponse(json)) return void setStatus(json.error);
+                return void setStatus(`Sunucu hatası (${res.status}).`);
             }
 
             if (!isOkResponse(json)) {
@@ -310,6 +294,8 @@ export default function Page() {
         setFileKey((k) => k + 1);
     };
 
+    const isPreparingPdf = !!pdf && images.length === 0 && pdfConvertStatus.includes("hazırlanıyor");
+
     return (
         <div style={{ display: "flex", gap: 20, padding: 20 }}>
             {/* Sol Panel */}
@@ -332,12 +318,7 @@ export default function Page() {
                         ordered.map((item) => (
                             <div
                                 key={item.id}
-                                style={{
-                                    border: "1px solid #e5e5e5",
-                                    padding: 10,
-                                    borderRadius: 10,
-                                    background: "#fff",
-                                }}
+                                style={{ border: "1px solid #e5e5e5", padding: 10, borderRadius: 10, background: "#fff" }}
                             >
                                 <button
                                     onClick={() => {
@@ -354,9 +335,7 @@ export default function Page() {
                                     }}
                                 >
                                     <strong style={{ display: "block" }}>{clip(item.result.title, 60)}</strong>
-                                    <p style={{ fontSize: 12, color: "#666", margin: "6px 0 0" }}>
-                                        {formatDateTR(item.createdAt)}
-                                    </p>
+                                    <p style={{ fontSize: 12, color: "#666", margin: "6px 0 0" }}>{formatDateTR(item.createdAt)}</p>
                                     <p style={{ fontSize: 12, color: "#666", margin: "4px 0 0" }}>
                                         {item.pdfName ? `📄 ${clip(item.pdfName, 24)}` : "—"}{" "}
                                         {typeof item.imageCount === "number" ? `• 🖼️ ${item.imageCount}` : ""}
@@ -387,11 +366,17 @@ export default function Page() {
                         <div>
                             <label style={{ fontWeight: 600 }}>PDF Dosyası</label>
                             <div style={{ marginTop: 6 }}>
-                                <input type="file" accept=".pdf" onChange={(e) => setPdf(e.target.files?.[0] || null)} />
+                                <input
+                                    type="file"
+                                    accept=".pdf"
+                                    onChange={(e) => {
+                                        setStatus("");
+                                        setSummary(null);
+                                        setPdf(e.target.files?.[0] || null);
+                                    }}
+                                />
                             </div>
-                            <div style={{ fontSize: 12, color: "#0b57d0", marginTop: 6 }}>
-                                {pdfConvertStatus}
-                            </div>
+                            <div style={{ fontSize: 12, color: "#0b57d0", marginTop: 6 }}>{pdfConvertStatus}</div>
                         </div>
 
                         <div>
@@ -401,11 +386,16 @@ export default function Page() {
                                     type="file"
                                     accept="image/*"
                                     multiple
-                                    onChange={(e) => setImages(Array.from(e.target.files || []))}
+                                    onChange={(e) => {
+                                        setStatus("");
+                                        setSummary(null);
+                                        setImages(Array.from(e.target.files || []));
+                                    }}
                                 />
                             </div>
                             <div style={{ fontSize: 12, color: "#666", marginTop: 6 }}>
-                                Manuel görsel eklemezsen, PDF’den çıkan ilk 2 sayfa otomatik kullanılacak.
+                                Manuel görsel eklersen PDF’den otomatik sayfa üretimi kullanılmaz. Manuel eklemezsen, PDF’den çıkan ilk 2
+                                sayfa otomatik kullanılır.
                             </div>
                         </div>
                     </div>
@@ -413,10 +403,15 @@ export default function Page() {
                     <div style={{ marginTop: 18, display: "flex", gap: 10 }}>
                         <button
                             onClick={handleSummarize}
-                            disabled={loading || !canProcess}
-                            style={{ padding: "10px 18px", cursor: loading || !canProcess ? "not-allowed" : "pointer" }}
+                            disabled={loading || !canProcess || isPreparingPdf}
+                            style={{
+                                padding: "10px 18px",
+                                cursor: loading || !canProcess || isPreparingPdf ? "not-allowed" : "pointer",
+                                opacity: loading || !canProcess || isPreparingPdf ? 0.7 : 1,
+                            }}
+                            title={isPreparingPdf ? "PDF sayfaları hazırlanıyor..." : ""}
                         >
-                            {loading ? "İşleniyor..." : "Özetle"}
+                            {loading ? "İşleniyor..." : isPreparingPdf ? "PDF Hazırlanıyor..." : "Özetle"}
                         </button>
                         <button onClick={clearAll} style={{ padding: "10px 18px" }}>
                             Temizle
@@ -440,10 +435,7 @@ export default function Page() {
                         <div>
                             <h2 style={{ marginTop: 0, color: "#000" }}>{summary.title}</h2>
 
-                            {/* ✅ Özet siyah */}
-                            <p style={{ lineHeight: 1.7, color: "#000", whiteSpace: "pre-wrap" }}>
-                                {summary.summary}
-                            </p>
+                            <p style={{ lineHeight: 1.7, color: "#000", whiteSpace: "pre-wrap" }}>{summary.summary}</p>
 
                             <div style={{ marginTop: 14, color: "#000" }}>
                                 <strong>Anahtar Kelimeler:</strong> {summary.keywords.join(", ")}
