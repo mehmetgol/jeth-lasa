@@ -1,9 +1,11 @@
+// src/app/api/summarize/route.ts
 import { NextResponse } from "next/server";
 import { auth } from "@clerk/nextjs/server";
 import { prisma } from "@/lib/prisma";
 import { Buffer } from "buffer";
 import { GoogleGenAI } from "@google/genai";
 import sharp from "sharp";
+import { SummarySource } from "@prisma/client";
 
 export const runtime = "nodejs";
 
@@ -11,6 +13,24 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 function isRecord(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null;
+}
+
+/**
+ * ✅ UI source -> Prisma Enum
+ * "pdf+image" => pdf_image
+ */
+function toDbSource(source: "pdf" | "image" | "pdf+image"): SummarySource {
+    if (source === "pdf") return SummarySource.pdf;
+    if (source === "image") return SummarySource.image;
+    return SummarySource.pdf_image;
+}
+
+/**
+ * ✅ Prisma Enum -> UI source
+ * pdf_image => "pdf+image"
+ */
+function toApiSource(source: SummarySource | string): "pdf" | "image" | "pdf+image" {
+    return source === "pdf_image" ? "pdf+image" : (source as "pdf" | "image");
 }
 
 /**
@@ -51,7 +71,7 @@ async function parsePdfToText(buffer: Buffer): Promise<string> {
     };
 
     const texts: string[] = [];
-    const maxPages = pdf.numPages; // ✅ tüm sayfalar
+    const maxPages = pdf.numPages;
 
     for (let i = 1; i <= maxPages; i++) {
         const page = await pdf.getPage(i);
@@ -155,10 +175,6 @@ function chunkText(s: string, chunkSize = 9000) {
     return out;
 }
 
-/**
- * Akademik özet şablonu (her yerde aynı dili/formatı koruyacağız)
- * NOT: JSON dışında hiçbir şey döndürmemesi kritik.
- */
 const ACADEMIC_GUIDE = [
     "ONLY return JSON. No markdown fences. No extra text.",
     'Schema: {"title"?:string,"summary":string,"keywords":string[]}',
@@ -266,8 +282,7 @@ export async function POST(req: Request) {
             }
         }
 
-        // 🔥 Dinamik özet uzunluğu (AKADEMİK: biraz daha derin)
-        // Not: İstersen bu eşikleri/uzunlukları yine değiştirebiliriz.
+        // 🔥 Dinamik özet uzunluğu
         let summaryLength = "18-24";
         if (pdfText && pdfText.length > 0) {
             if (pdfText.length < 10000) {
@@ -315,16 +330,10 @@ export async function POST(req: Request) {
         // 3) Özet üret
         let raw = "";
 
-        // ✅ Eğer text layer varsa ve metin büyükse: tüm PDF -> chunk summarize (AKADEMİK final)
-        // Not: Görsel de varsa (manuel/auto) tek çağrıya düşüyoruz (en stabil).
         if (pdfText && pdfText.length > 12000 && !hasAnyImages) {
             raw = await summarizeFullPdfTextAcademic(pdfText, summaryLength);
         } else {
-            // Görsel varsa veya metin kısa ise: tek çağrı (AKADEMİK prompt)
-            const parts: Array<
-                | { text: string }
-                | { inlineData: { mimeType: string; data: string } }
-            > = [];
+            const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
 
             parts.push({
                 text:
@@ -334,13 +343,11 @@ export async function POST(req: Request) {
                     (hasAnyImages ? "IMAGES attached below.\n" : "IMAGES: (none)\n"),
             });
 
-            // Manuel görseller
             for (const img of images.slice(0, 4)) {
                 const { mime, b64 } = await compressImageToJpegBase64(img);
                 parts.push({ inlineData: { mimeType: mime, data: b64 } });
             }
 
-            // Otomatik PDF görselleri (scan fallback)
             for (const a of autoPdfImages.slice(0, 4)) {
                 parts.push({ inlineData: { mimeType: a.mime, data: a.b64 } });
             }
@@ -355,22 +362,21 @@ export async function POST(req: Request) {
 
         const parsed = parseSummary(raw);
         if (!parsed) {
-            return NextResponse.json(
-                { ok: false, error: "Model JSON dönmedi.", raw: raw.slice(0, 300) },
-                { status: 500 }
-            );
+            return NextResponse.json({ ok: false, error: "Model JSON dönmedi.", raw: raw.slice(0, 300) }, { status: 500 });
         }
 
-        const source: "pdf" | "image" | "pdf+image" =
+        const sourceUI: "pdf" | "image" | "pdf+image" =
             pdfFile && hasAnyImages ? "pdf+image" : pdfFile ? "pdf" : "image";
+
+        const sourceDB = toDbSource(sourceUI);
 
         const saved = await prisma.summary.create({
             data: {
                 userId,
-                source,
-                title: (parsed.title?.slice(0, 140) || "Akademik Özet"),
+                source: sourceDB, // ✅ enum
+                title: parsed.title?.slice(0, 140) || "Akademik Özet",
                 summary: parsed.summary,
-                keywords: JSON.stringify(parsed.keywords),
+                keywords: parsed.keywords, // ✅ Json/string[] ise parse/stringify yok
                 inputText: pdfText || "",
             },
             select: {
@@ -387,7 +393,8 @@ export async function POST(req: Request) {
             ok: true,
             data: {
                 ...saved,
-                keywords: JSON.parse(saved.keywords) as string[],
+                source: toApiSource(saved.source),
+                keywords: Array.isArray(saved.keywords) ? (saved.keywords as string[]) : [], // ✅ TS2345 fix
             },
         });
     } catch (e: unknown) {

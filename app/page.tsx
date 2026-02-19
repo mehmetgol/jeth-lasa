@@ -435,6 +435,7 @@ export default function Page() {
                         <div>
                             <h2 style={{ marginTop: 0, color: "#000" }}>{summary.title}</h2>
 
+                            {/* ✅ Özet kısmı SİYAH */}
                             <p style={{ lineHeight: 1.7, color: "#000", whiteSpace: "pre-wrap" }}>{summary.summary}</p>
 
                             <div style={{ marginTop: 14, color: "#000" }}>
