@@ -11,24 +11,14 @@ type ApiSummary = {
 };
 
 type HistoryItem = {
-    id: string;
-    createdAt: number;
+    id: string; // ✅ artık DB id
+    createdAt: number; // ✅ ms timestamp (UI için)
     pdfName?: string;
     imageCount?: number;
     result: ApiSummary;
 };
 
-const STORAGE_KEY = "jethulasa_history_v3";
-
 // --- Yardımcı Fonksiyonlar ---
-function safeParse<T>(raw: string | null, fallback: T): T {
-    try {
-        return raw ? (JSON.parse(raw) as T) : fallback;
-    } catch {
-        return fallback;
-    }
-}
-
 function formatDateTR(ts: number) {
     return new Date(ts).toLocaleString("tr-TR");
 }
@@ -38,22 +28,10 @@ function clip(s: string, n: number) {
     return t.length <= n ? t : t.slice(0, n) + "…";
 }
 
-function isApiSummary(v: unknown): v is ApiSummary {
+function isOkResponse(v: unknown): v is { ok: true; data: any } {
     if (typeof v !== "object" || v === null) return false;
     const o = v as Record<string, unknown>;
-    return (
-        typeof o.title === "string" &&
-        typeof o.summary === "string" &&
-        Array.isArray(o.keywords) &&
-        o.keywords.every((k) => typeof k === "string") &&
-        (o.source === "pdf" || o.source === "image" || o.source === "pdf+image")
-    );
-}
-
-function isOkResponse(v: unknown): v is { ok: true; data: ApiSummary } {
-    if (typeof v !== "object" || v === null) return false;
-    const o = v as Record<string, unknown>;
-    return o.ok === true && "data" in o && isApiSummary(o.data);
+    return o.ok === true && "data" in o;
 }
 
 function isErrResponse(v: unknown): v is { ok: false; error: string } {
@@ -95,6 +73,20 @@ async function fetchWithRetry(input: RequestInfo | URL, init: RequestInit, retri
     }
 
     throw lastErr ?? new Error("Beklenmeyen hata");
+}
+
+// ✅ DB source -> UI source (kritik!)
+function toUiSource(s: unknown): ApiSummary["source"] {
+    if (s === "pdf") return "pdf";
+    if (s === "image") return "image";
+    if (s === "pdf_image" || s === "pdf+image") return "pdf+image";
+    return "pdf";
+}
+
+// ✅ keywords Json -> string[]
+function normalizeKeywords(v: unknown): string[] {
+    if (Array.isArray(v)) return v.filter((x) => typeof x === "string") as string[];
+    return [];
 }
 
 // ✅ PDF -> PNG Dönüştürücü (TS uyumlu, GlobalWorkerOptions hatasız)
@@ -161,20 +153,53 @@ export default function Page() {
     const [history, setHistory] = useState<HistoryItem[]>([]);
     const [fileKey, setFileKey] = useState<number>(0);
 
-    // LocalStorage Yükleme
-    useEffect(() => {
-        const loaded = safeParse<HistoryItem[]>(
-            typeof window !== "undefined" ? localStorage.getItem(STORAGE_KEY) : null,
-            []
-        );
-        setHistory(loaded);
-    }, []);
+    // ✅ DB'den geçmişi çek (multi-tenant: backend userId ile filtreler)
+    async function refreshHistory() {
+        try {
+            const res = await fetch("/api/history", { method: "GET" });
+            const json: unknown = await res.json().catch(() => null);
 
-    // LocalStorage Kaydetme
+            if (!res.ok) {
+                if (res.status === 401) setHistory([]); // giriş yoksa boş
+                setStatus(isErrResponse(json) ? json.error : `Geçmiş alınamadı (${res.status}).`);
+                return;
+            }
+
+            if (!isOkResponse(json)) {
+                setStatus("Geçmiş formatı beklenmiyor.");
+                return;
+            }
+
+            const rows = (json as any).data as any[];
+            const mapped: HistoryItem[] = rows.map((x) => {
+                const uiSummary: ApiSummary = {
+                    title: String(x.title ?? ""),
+                    summary: String(x.summary ?? ""),
+                    keywords: normalizeKeywords(x.keywords),
+                    source: toUiSource(x.source),
+                };
+
+                return {
+                    id: String(x.id),
+                    createdAt: new Date(x.createdAt).getTime(),
+                    pdfName: x.pdfName ?? undefined,
+                    imageCount: typeof x.imageCount === "number" ? x.imageCount : undefined,
+                    result: uiSummary,
+                };
+            });
+
+            setHistory(mapped);
+        } catch (e) {
+            console.error(e);
+            setStatus("Geçmiş alınamadı (ağ hatası).");
+        }
+    }
+
+    // ✅ ilk açılışta geçmişi çek
     useEffect(() => {
-        if (typeof window === "undefined") return;
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(history));
-    }, [history]);
+        refreshHistory();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     const ordered = useMemo(() => [...history].sort((a, b) => b.createdAt - a.createdAt), [history]);
 
@@ -202,9 +227,7 @@ export default function Page() {
                 if (!alive) return;
 
                 if (imgs.length === 0) {
-                    setPdfConvertStatus(
-                        "PDF içeriği okunamadı. Bu PDF taranmış olabilir. (Çözüm: Manuel sayfa görseli ekleyin.)"
-                    );
+                    setPdfConvertStatus("PDF içeriği okunamadı. Bu PDF taranmış olabilir. (Çözüm: Manuel sayfa görseli ekleyin.)");
                 } else {
                     setPdfImages(imgs);
                     setPdfConvertStatus(`PDF'den ${imgs.length} sayfa hazırlandı ✅`);
@@ -212,9 +235,7 @@ export default function Page() {
             } catch (e) {
                 console.error("PDF İşleme Hatası:", e);
                 if (!alive) return;
-                setPdfConvertStatus(
-                    "PDF dönüştürme hatası. Bu PDF taranmış/korumalı olabilir. (Çözüm: Manuel görsel ekleyin.)"
-                );
+                setPdfConvertStatus("PDF dönüştürme hatası. Bu PDF taranmış/korumalı olabilir. (Çözüm: Manuel görsel ekleyin.)");
             }
         }
 
@@ -263,15 +284,24 @@ export default function Page() {
                 return;
             }
 
-            const data = json.data;
-            setSummary(data);
+            const data = (json as any).data as any;
 
+            const uiSummary: ApiSummary = {
+                title: String(data.title ?? ""),
+                summary: String(data.summary ?? ""),
+                keywords: normalizeKeywords(data.keywords),
+                source: toUiSource(data.source),
+            };
+
+            setSummary(uiSummary);
+
+            // ✅ history’ye DB id ile ekle
             const entry: HistoryItem = {
-                id: crypto.randomUUID(),
-                createdAt: Date.now(),
-                pdfName: pdf?.name,
-                imageCount: fd.getAll("images").length,
-                result: data,
+                id: String(data.id),
+                createdAt: new Date(data.createdAt).getTime(),
+                pdfName: data.pdfName ?? pdf?.name,
+                imageCount: typeof data.imageCount === "number" ? data.imageCount : fd.getAll("images").length,
+                result: uiSummary,
             };
 
             setHistory((prev) => [entry, ...prev]);
@@ -294,6 +324,24 @@ export default function Page() {
         setFileKey((k) => k + 1);
     };
 
+    const clearHistoryDb = async () => {
+        try {
+            // ✅ Basit yol: tek tek sil (ama sağlamlaştırdık)
+            for (const item of history) {
+                const r = await fetch(`/api/history/${item.id}`, { method: "DELETE" });
+                if (!r.ok && r.status !== 404) {
+                    setStatus(`Geçmiş silinirken hata oluştu (${r.status}).`);
+                    return;
+                }
+            }
+            await refreshHistory(); // ✅ DB ile senkron
+            setStatus("Geçmiş silindi ✅");
+        } catch (e) {
+            console.error(e);
+            setStatus("Geçmiş silinemedi.");
+        }
+    };
+
     const isPreparingPdf = !!pdf && images.length === 0 && pdfConvertStatus.includes("hazırlanıyor");
 
     return (
@@ -303,7 +351,7 @@ export default function Page() {
                 <h3 style={{ marginTop: 0 }}>Geçmiş</h3>
 
                 <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-                    <button onClick={() => setHistory([])} style={{ padding: "6px 10px" }}>
+                    <button onClick={clearHistoryDb} style={{ padding: "6px 10px" }}>
                         Geçmişi Sil
                     </button>
                     <button onClick={clearAll} style={{ padding: "6px 10px" }}>
@@ -316,10 +364,7 @@ export default function Page() {
                         <div style={{ color: "#777", fontSize: 13 }}>Henüz kayıt yok.</div>
                     ) : (
                         ordered.map((item) => (
-                            <div
-                                key={item.id}
-                                style={{ border: "1px solid #e5e5e5", padding: 10, borderRadius: 10, background: "#fff" }}
-                            >
+                            <div key={item.id} style={{ border: "1px solid #e5e5e5", padding: 10, borderRadius: 10, background: "#fff" }}>
                                 <button
                                     onClick={() => {
                                         setSummary(item.result);
@@ -343,7 +388,14 @@ export default function Page() {
                                 </button>
 
                                 <button
-                                    onClick={() => setHistory((h) => h.filter((x) => x.id !== item.id))}
+                                    onClick={async () => {
+                                        const r = await fetch(`/api/history/${item.id}`, { method: "DELETE" });
+                                        if (!r.ok && r.status !== 404) {
+                                            setStatus(`Silme başarısız (${r.status}).`);
+                                            return;
+                                        }
+                                        setHistory((h) => h.filter((x) => x.id !== item.id));
+                                    }}
                                     style={{ fontSize: 11, color: "crimson", marginTop: 8 }}
                                 >
                                     Sil
@@ -394,8 +446,7 @@ export default function Page() {
                                 />
                             </div>
                             <div style={{ fontSize: 12, color: "#666", marginTop: 6 }}>
-                                Manuel görsel eklersen PDF’den otomatik sayfa üretimi kullanılmaz. Manuel eklemezsen, PDF’den çıkan ilk 2
-                                sayfa otomatik kullanılır.
+                                Manuel görsel eklersen PDF’den otomatik sayfa üretimi kullanılmaz. Manuel eklemezsen, PDF’den çıkan ilk 2 sayfa otomatik kullanılır.
                             </div>
                         </div>
                     </div>
@@ -422,15 +473,7 @@ export default function Page() {
                 </div>
 
                 {/* Sonuç */}
-                <div
-                    style={{
-                        marginTop: 20,
-                        padding: 20,
-                        background: "#f9f9f9",
-                        border: "1px solid #eee",
-                        borderRadius: 12,
-                    }}
-                >
+                <div style={{ marginTop: 20, padding: 20, background: "#f9f9f9", border: "1px solid #eee", borderRadius: 12 }}>
                     {summary ? (
                         <div>
                             <h2 style={{ marginTop: 0, color: "#000" }}>{summary.title}</h2>

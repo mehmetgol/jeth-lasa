@@ -1,6 +1,6 @@
 // src/app/api/summarize/route.ts
 import { NextResponse } from "next/server";
-import { auth } from "@clerk/nextjs/server";
+import { auth } from "@clerk/nextjs/server"; // ✅ getAuth değil, auth
 import { prisma } from "@/lib/prisma";
 import { Buffer } from "buffer";
 import { GoogleGenAI } from "@google/genai";
@@ -15,27 +15,24 @@ function isRecord(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null;
 }
 
-/**
- * ✅ UI source -> Prisma Enum
- * "pdf+image" => pdf_image
- */
+async function ensureUserRow(userId: string) {
+    await prisma.user.upsert({
+        where: { id: userId },
+        update: {},
+        create: { id: userId },
+    });
+}
+
 function toDbSource(source: "pdf" | "image" | "pdf+image"): SummarySource {
     if (source === "pdf") return SummarySource.pdf;
     if (source === "image") return SummarySource.image;
     return SummarySource.pdf_image;
 }
 
-/**
- * ✅ Prisma Enum -> UI source
- * pdf_image => "pdf+image"
- */
 function toApiSource(source: SummarySource | string): "pdf" | "image" | "pdf+image" {
     return source === "pdf_image" ? "pdf+image" : (source as "pdf" | "image");
 }
 
-/**
- * PDF -> text (text layer varsa) | ✅ TÜM SAYFALAR
- */
 async function parsePdfToText(buffer: Buffer): Promise<string> {
     const pdfjs: unknown = await import("pdfjs-dist/legacy/build/pdf.mjs");
 
@@ -71,9 +68,7 @@ async function parsePdfToText(buffer: Buffer): Promise<string> {
     };
 
     const texts: string[] = [];
-    const maxPages = pdf.numPages;
-
-    for (let i = 1; i <= maxPages; i++) {
+    for (let i = 1; i <= pdf.numPages; i++) {
         const page = await pdf.getPage(i);
         const tc = await page.getTextContent();
         for (const item of tc.items) if (item?.str) texts.push(item.str);
@@ -83,7 +78,6 @@ async function parsePdfToText(buffer: Buffer): Promise<string> {
     return texts.join(" ").replace(/\s+/g, " ").trim();
 }
 
-// ---- JSON parse ----
 type SummaryJSON = { title?: string; summary: string; keywords: string[] };
 
 function extractJson(raw: string): string | null {
@@ -122,7 +116,11 @@ function parseSummary(raw: string): SummaryJSON | null {
     }
 }
 
-// ✅ Görselleri küçült (Gemini'ye yollamadan önce)
+function normalizeKeywordsFromJson(v: unknown): string[] {
+    if (Array.isArray(v)) return v.filter((x) => typeof x === "string") as string[];
+    return [];
+}
+
 async function compressImageToJpegBase64(file: File): Promise<{ mime: string; b64: string }> {
     const ab = await file.arrayBuffer();
     const input = Buffer.from(ab);
@@ -136,7 +134,6 @@ async function compressImageToJpegBase64(file: File): Promise<{ mime: string; b6
     return { mime: "image/jpeg", b64: out.toString("base64") };
 }
 
-// ✅ Scan PDF için: PDF buffer -> ilk N sayfayı JPEG base64'e çevir (sharp ile)
 async function pdfBufferToJpegPagesBase64(
     pdfBuffer: Buffer,
     maxPages = 2
@@ -166,7 +163,6 @@ async function pdfBufferToJpegPagesBase64(
     return out;
 }
 
-// ✅ Tüm PDF için: Chunk (map-reduce) özet
 function chunkText(s: string, chunkSize = 9000) {
     const t = (s || "").trim();
     if (!t) return [];
@@ -255,10 +251,13 @@ export async function POST(req: Request) {
             return NextResponse.json({ ok: false, error: "GEMINI_API_KEY yok (.env.local)." }, { status: 500 });
         }
 
+        // ✅ SENİN PROJEDE DOĞRU OLAN: await auth()
         const { userId } = await auth();
         if (!userId) {
             return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
         }
+
+        await ensureUserRow(userId);
 
         const form = await req.formData();
         const pdfFile = form.get("pdf") as File | null;
@@ -268,7 +267,6 @@ export async function POST(req: Request) {
             return NextResponse.json({ ok: false, error: "PDF veya en az 1 görsel yükle." }, { status: 400 });
         }
 
-        // 1) PDF text çıkar (tüm sayfalar)
         let pdfText = "";
         let pdfBuf: Buffer | null = null;
 
@@ -282,19 +280,13 @@ export async function POST(req: Request) {
             }
         }
 
-        // 🔥 Dinamik özet uzunluğu
         let summaryLength = "18-24";
         if (pdfText && pdfText.length > 0) {
-            if (pdfText.length < 10000) {
-                summaryLength = "16-22";
-            } else if (pdfText.length < 40000) {
-                summaryLength = "24-34";
-            } else {
-                summaryLength = "34-45";
-            }
+            if (pdfText.length < 10000) summaryLength = "16-22";
+            else if (pdfText.length < 40000) summaryLength = "24-34";
+            else summaryLength = "34-45";
         }
 
-        // 2) Taranmış PDF (text yok) + kullanıcı görsel yoksa: PDF’den ilk 2 sayfayı görsele çevir
         let autoPdfImages: Array<{ mime: string; b64: string }> = [];
 
         if (pdfFile && pdfText.trim().length === 0 && images.length === 0) {
@@ -327,9 +319,7 @@ export async function POST(req: Request) {
 
         const hasAnyImages = images.length > 0 || autoPdfImages.length > 0;
 
-        // 3) Özet üret
         let raw = "";
-
         if (pdfText && pdfText.length > 12000 && !hasAnyImages) {
             raw = await summarizeFullPdfTextAcademic(pdfText, summaryLength);
         } else {
@@ -367,17 +357,18 @@ export async function POST(req: Request) {
 
         const sourceUI: "pdf" | "image" | "pdf+image" =
             pdfFile && hasAnyImages ? "pdf+image" : pdfFile ? "pdf" : "image";
-
         const sourceDB = toDbSource(sourceUI);
 
         const saved = await prisma.summary.create({
             data: {
                 userId,
-                source: sourceDB, // ✅ enum
+                source: sourceDB,
                 title: parsed.title?.slice(0, 140) || "Akademik Özet",
                 summary: parsed.summary,
-                keywords: parsed.keywords, // ✅ Json/string[] ise parse/stringify yok
+                keywords: parsed.keywords,
                 inputText: pdfText || "",
+                pdfName: pdfFile?.name ?? null,
+                imageCount: images.length > 0 ? images.length : autoPdfImages.length,
             },
             select: {
                 id: true,
@@ -386,6 +377,8 @@ export async function POST(req: Request) {
                 title: true,
                 summary: true,
                 keywords: true,
+                pdfName: true,
+                imageCount: true,
             },
         });
 
@@ -394,7 +387,7 @@ export async function POST(req: Request) {
             data: {
                 ...saved,
                 source: toApiSource(saved.source),
-                keywords: Array.isArray(saved.keywords) ? (saved.keywords as string[]) : [], // ✅ TS2345 fix
+                keywords: normalizeKeywordsFromJson(saved.keywords),
             },
         });
     } catch (e: unknown) {
