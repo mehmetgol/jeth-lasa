@@ -1,0 +1,44 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id // Clerk userId
+  email     String?  @unique
+  name      String?
+  createdAt DateTime @default(now())
+
+  summaries Summary[]
+}
+
+enum SummarySource {
+  pdf
+  image
+  pdf_image
+}
+
+model Summary {
+  id         String        @id @default(cuid())
+
+  userId     String
+  user       User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  source     SummarySource
+  title      String
+  summary    String
+  keywords   Json          // ✅ string[] direkt saklanır
+  inputText  String?
+
+  pdfName    String?
+  imageCount Int?
+
+  createdAt  DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([userId, id])
+}
